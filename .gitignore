@@ -1,0 +1,35 @@
+# Secrets & Environment
+.env
+.env.*
+!.env.example
+
+# SQLite Databases & Journals
+*.db
+*.db-shm
+*.db-wal
+*.sqlite
+*.sqlite3
+data/*.db*
+
+# Logs
+*.log
+logs/
+
+# OS Artifacts
+.DS_Store
+
+# Python Bytecode & Virtual Environments
+__pycache__/
+*.py[cod]
+*$py.class
+.venv/
+venv/
+env/
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+.coverage
+htmlcov/
+dist/
+build/
+*.egg-info/

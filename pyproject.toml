@@ -1,0 +1,35 @@
+[build-system]
+requires = ["setuptools>=68.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "alpaca-gemini-trader"
+version = "0.1.0"
+description = "Modular, fail-closed automated equities and options paper trading system with Alpaca and Google GenAI"
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = [
+    "alpaca-py>=0.30.0",
+    "google-genai>=1.0.0",
+    "pydantic>=2.7.0",
+    "pydantic-settings>=2.2.0",
+    "pandas>=2.2.0",
+    "numpy>=1.26.0",
+    "streamlit>=1.35.0",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8.0.0",
+]
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["src*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["."]
+filterwarnings = [
+    "ignore::SyntaxWarning:google\\.genai.*",
+]
