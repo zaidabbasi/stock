@@ -88,6 +88,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     if args.command == "status":
         sys_state = ledger.get_system_state()
         wheel_cycles = ledger.list_wheel_cycles()
+        open_spreads = ledger.list_spread_positions(states=("PENDING_OPEN", "OPEN", "PENDING_CLOSE"))
         recent_logs = ledger.list_audit_logs(limit=10)
         open_tracked = ledger.list_tracked_orders(status="OPEN")
         payload = {
@@ -98,6 +99,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             "has_gemini_key": settings.has_gemini_key,
             "system_state": sys_state.__dict__ if sys_state else None,
             "active_wheel_cycles": [c.__dict__ for c in wheel_cycles],
+            "open_spreads": len(open_spreads),
             "open_tracked_orders": len(open_tracked),
             "recent_audit_count": len(recent_logs),
         }

@@ -3,12 +3,14 @@
 from __future__ import annotations
 
 import hashlib
+import json
 import logging
-from typing import Optional
+from typing import Any, Optional
 
 from src.config import NY_TZ, Settings
 from src.execution.broker import AlpacaBroker, BrokerOrderResult
 from src.intelligence.schemas import (
+    OptionRight,
     OrderIntent,
     PolicyId,
     PortfolioSnapshot,
@@ -21,7 +23,72 @@ from src.persistence.ledger import LedgerRepository
 
 logger = logging.getLogger(__name__)
 
-_CLOSING_ACTIONS = frozenset({TradeAction.BUY_TO_CLOSE_CSP, TradeAction.BUY_TO_CLOSE_CC})
+_CLOSING_ACTIONS = frozenset(
+    {
+        TradeAction.BUY_TO_CLOSE_CSP,
+        TradeAction.BUY_TO_CLOSE_CC,
+        TradeAction.CLOSE_BULL_PUT_SPREAD,
+        TradeAction.CLOSE_IRON_CONDOR,
+    }
+)
+
+
+def compute_defined_risk_spread_metrics(intent: OrderIntent) -> tuple[bool, float, float, str]:
+    """
+    Deterministically verify that a multi-leg credit spread / Iron Condor intent is strictly
+    defined-risk and return `(valid, wing_collateral_usd, max_net_loss_usd, reason)`.
+    """
+    legs = intent.legs
+    expected_legs = 4 if intent.action == TradeAction.OPEN_IRON_CONDOR else 2
+    if len(legs) != expected_legs:
+        return False, 0.0, 0.0, f"{intent.action.value} requires {expected_legs} legs; got {len(legs)}."
+    if len({leg.option_symbol for leg in legs}) != len(legs):
+        return False, 0.0, 0.0, "Spread legs contain duplicate option symbols."
+
+    by_exp: dict[object, dict[str, list[Any]]] = {}
+    for leg in legs:
+        if not leg.option_symbol.startswith(intent.ticker):
+            return False, 0.0, 0.0, f"Leg '{leg.option_symbol}' does not match ticker '{intent.ticker}'."
+        b = by_exp.setdefault(leg.expiration_date, {"sp": [], "lp": [], "sc": [], "lc": []})
+        if leg.right == OptionRight.PUT:
+            b["sp" if leg.side == "SELL" else "lp"].append(leg)
+        else:
+            b["sc" if leg.side == "SELL" else "lc"].append(leg)
+
+    total_worst_width = 0.0
+    for b in by_exp.values():
+        sp = sorted(b["sp"], key=lambda x: x.strike_price, reverse=True)
+        lp = sorted(b["lp"], key=lambda x: x.strike_price, reverse=True)
+        sc = sorted(b["sc"], key=lambda x: x.strike_price)
+        lc = sorted(b["lc"], key=lambda x: x.strike_price)
+
+        if len(sp) != len(lp):
+            return False, 0.0, 0.0, "Put spread legs must have 1:1 protective long put pairing."
+        if len(sc) != len(lc):
+            return False, 0.0, 0.0, "Call spread legs must have 1:1 protective long call pairing."
+
+        put_width = 0.0
+        for s_leg, l_leg in zip(sp, lp):
+            if s_leg.ratio_qty != l_leg.ratio_qty or l_leg.strike_price >= s_leg.strike_price:
+                return False, 0.0, 0.0, "Long protective put must have strictly lower strike and equal ratio_qty."
+            put_width += (s_leg.strike_price - l_leg.strike_price) * 100.0 * s_leg.ratio_qty * intent.qty
+
+        call_width = 0.0
+        for s_leg, l_leg in zip(sc, lc):
+            if s_leg.ratio_qty != l_leg.ratio_qty or l_leg.strike_price <= s_leg.strike_price:
+                return False, 0.0, 0.0, "Long protective call must have strictly higher strike and equal ratio_qty."
+            call_width += (l_leg.strike_price - s_leg.strike_price) * 100.0 * s_leg.ratio_qty * intent.qty
+
+        if intent.action == TradeAction.OPEN_BULL_PUT_SPREAD and (put_width <= 0.0 or len(sc) > 0):
+            return False, 0.0, 0.0, "OPEN_BULL_PUT_SPREAD must consist strictly of one defined-risk put credit spread."
+        if intent.action == TradeAction.OPEN_IRON_CONDOR and (put_width <= 0.0 or call_width <= 0.0):
+            return False, 0.0, 0.0, "OPEN_IRON_CONDOR requires valid defined-risk put AND call wings."
+
+        total_worst_width += max(put_width, call_width)
+
+    credit_usd = (intent.limit_price or 0.0) * 100.0 * intent.qty
+    max_loss = max(0.0, total_worst_width - credit_usd)
+    return True, round(total_worst_width, 2), round(max_loss, 2), "OK"
 
 
 def generate_deterministic_client_order_id(
@@ -226,16 +293,33 @@ class RiskGateway:
         # ---------------------------------------------------------------------
         # 4. TRD-POL-001: Single-Ticker Concentration Cap (<= 5% Total Equity)
         # ---------------------------------------------------------------------
+        spread_collateral_needed = 0.0
+        spread_max_loss = 0.0
+        if intent.action in (TradeAction.OPEN_BULL_PUT_SPREAD, TradeAction.OPEN_IRON_CONDOR):
+            valid_spread, spread_collateral_needed, spread_max_loss, spread_err = compute_defined_risk_spread_metrics(intent)
+            if not valid_spread:
+                return self._reject(
+                    intent=intent,
+                    client_order_id=client_order_id,
+                    policy_id=PolicyId.TRD_POL_002,
+                    reason=f"Defined-risk spread validation failed: {spread_err}",
+                    portfolio=portfolio,
+                )
+
         exposure_increasing_actions = {
             TradeAction.BUY_EQUITY,
             TradeAction.ADD_DIP_TRANCHE,
             TradeAction.SELL_CSP,
+            TradeAction.OPEN_BULL_PUT_SPREAD,
+            TradeAction.OPEN_IRON_CONDOR,
         }
         if intent.action in exposure_increasing_actions:
             existing_exposure = portfolio.ticker_notional_exposure.get(intent.ticker, 0.0)
             if intent.action == TradeAction.SELL_CSP:
                 csp_assignment_notional = 100.0 * (intent.strike_price or 0.0) * intent.qty
                 added_exposure = max(intent.notional_exposure_delta, csp_assignment_notional)
+            elif intent.action in (TradeAction.OPEN_BULL_PUT_SPREAD, TradeAction.OPEN_IRON_CONDOR):
+                added_exposure = max(intent.notional_exposure_delta, spread_max_loss)
             else:
                 added_exposure = intent.notional_exposure_delta
 
@@ -256,18 +340,25 @@ class RiskGateway:
                 )
 
         # ---------------------------------------------------------------------
-        # 5. TRD-POL-002: Cash-Secured Put Collateral Lock
+        # 5. TRD-POL-002: Option Collateral Lock (CSP + Defined-Risk Spreads)
         # ---------------------------------------------------------------------
-        if intent.action == TradeAction.SELL_CSP:
-            if intent.strike_price is None or intent.strike_price <= 0:
-                return self._reject(
-                    intent=intent,
-                    client_order_id=client_order_id,
-                    policy_id=PolicyId.TRD_POL_002,
-                    reason="SELL_CSP intent missing valid positive strike_price.",
-                    portfolio=portfolio,
-                )
-            required_collateral = 100.0 * intent.strike_price * intent.qty
+        if intent.action in (
+            TradeAction.SELL_CSP,
+            TradeAction.OPEN_BULL_PUT_SPREAD,
+            TradeAction.OPEN_IRON_CONDOR,
+        ):
+            if intent.action == TradeAction.SELL_CSP:
+                if intent.strike_price is None or intent.strike_price <= 0:
+                    return self._reject(
+                        intent=intent,
+                        client_order_id=client_order_id,
+                        policy_id=PolicyId.TRD_POL_002,
+                        reason="SELL_CSP intent missing valid positive strike_price.",
+                        portfolio=portfolio,
+                    )
+                required_collateral = 100.0 * intent.strike_price * intent.qty
+            else:
+                required_collateral = spread_collateral_needed
             ledger_reserved = self.ledger.get_total_reserved_csp_collateral()
             # Avoid double-subtracting CSP collateral already deducted by Alpaca in buying power
             uncounted_reserved = max(0.0, ledger_reserved - portfolio.broker_reserved_csp_collateral)
@@ -284,7 +375,7 @@ class RiskGateway:
                     client_order_id=client_order_id,
                     policy_id=PolicyId.TRD_POL_002,
                     reason=(
-                        f"Insufficient cash collateral for '{intent.ticker}' CSP: required=${required_collateral:,.2f}, "
+                        f"Insufficient cash collateral for '{intent.ticker}' option trade: required=${required_collateral:,.2f}, "
                         f"available=${available_buying_power:,.2f} (non_marginable_bp=${portfolio.non_marginable_buying_power:,.2f}, "
                         f"uncounted_reserved=${uncounted_reserved:,.2f})."
                     ),
@@ -421,6 +512,37 @@ class RiskGateway:
             self.ledger.update_tracked_order(
                 order_result.alpaca_order_id,
                 protection_status="PENDING",
+            )
+        elif intent.action in (TradeAction.OPEN_BULL_PUT_SPREAD, TradeAction.OPEN_IRON_CONDOR):
+            _, _, max_loss, _ = compute_defined_risk_spread_metrics(intent)
+            credit = float(intent.limit_price or 0.0)
+            sid = intent.spread_id or decision.client_order_id
+            structure = "IRON_CONDOR" if intent.action == TradeAction.OPEN_IRON_CONDOR else "BULL_PUT_SPREAD"
+            legs_json = json.dumps([leg.model_dump(mode="json") for leg in intent.legs])
+            pt = round(max(0.05, credit * (1.0 - self.settings.SPREAD_PROFIT_TAKE_RATIO)), 2)
+            sl = round(max(credit + 0.10, credit * self.settings.SPREAD_STOP_LOSS_MULTIPLE), 2)
+            self.ledger.record_spread_pending_open(
+                spread_id=sid,
+                ticker=intent.ticker,
+                structure=structure,
+                expiration_date=intent.legs[0].expiration_date.isoformat(),
+                qty=intent.qty,
+                legs_json=legs_json,
+                entry_credit_per_spread=credit,
+                max_risk_usd=max_loss,
+                profit_target_debit=pt,
+                stop_loss_debit=sl,
+                open_order_id=order_result.alpaca_order_id,
+                as_of_ny=portfolio.as_of_ny,
+            )
+        elif (
+            intent.action in (TradeAction.CLOSE_BULL_PUT_SPREAD, TradeAction.CLOSE_IRON_CONDOR)
+            and intent.spread_id
+        ):
+            self.ledger.mark_spread_pending_close(
+                spread_id=intent.spread_id,
+                close_order_id=order_result.alpaca_order_id,
+                as_of_ny=portfolio.as_of_ny,
             )
 
         return decision, order_result

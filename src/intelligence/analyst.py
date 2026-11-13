@@ -177,6 +177,48 @@ class GeminiAnalyst:
         if packet.realized_vol_20d > self.settings.MAX_REALIZED_VOL_20D:
             flags.append("ELEVATED_VOLATILITY")
 
+        if packet.strategy_candidate == StrategyType.CREDIT_SPREAD:
+            if packet.rsi_14d < 25.0:
+                return TradeProposal(
+                    ticker=packet.ticker,
+                    strategy=StrategyType.CREDIT_SPREAD,
+                    action=TradeAction.HOLD,
+                    conviction_score=0.40,
+                    rationale=(
+                        f"Rules filter held credit spread on {packet.ticker}: RSI {packet.rsi_14d:.1f} < 25 "
+                        "(extreme knife-fall guard)."
+                    ),
+                    risk_flags=[*flags, "EXTREME_DOWNSIDE_MOMENTUM"],
+                    reject_reason="RSI below 25 crash guard for put-credit structures.",
+                )
+            if packet.realized_vol_20d > max(0.85, self.settings.MAX_REALIZED_VOL_20D):
+                return TradeProposal(
+                    ticker=packet.ticker,
+                    strategy=StrategyType.CREDIT_SPREAD,
+                    action=TradeAction.HOLD,
+                    conviction_score=0.45,
+                    rationale=f"Rules filter held credit spread on {packet.ticker}: extreme realized vol {packet.realized_vol_20d:.1%}.",
+                    risk_flags=flags,
+                    reject_reason="Realized volatility above credit-spread safety threshold.",
+                )
+            preferred_action = (
+                TradeAction.OPEN_BULL_PUT_SPREAD
+                if packet.rsi_14d < 40.0
+                else TradeAction.OPEN_IRON_CONDOR
+            )
+            return TradeProposal(
+                ticker=packet.ticker,
+                strategy=StrategyType.CREDIT_SPREAD,
+                action=preferred_action,
+                conviction_score=max(self.settings.MIN_CONVICTION_SCORE, 0.80),
+                rationale=(
+                    f"Rules-mode defined-risk credit spread approval for {packet.ticker}: RSI={packet.rsi_14d:.1f}, "
+                    f"20d vol={packet.realized_vol_20d:.1%}, dollar vol=${packet.avg_daily_dollar_volume:,.0f}."
+                ),
+                risk_flags=flags,
+                reject_reason=None,
+            )
+
         if packet.strategy_candidate == StrategyType.WHEEL:
             if packet.rsi_14d < 30.0:
                 return TradeProposal(

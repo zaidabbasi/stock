@@ -199,11 +199,37 @@ CREATE TABLE IF NOT EXISTS equity_snapshots (
     intraday_peak_equity    REAL NOT NULL,
     daily_pnl_pct           REAL NOT NULL
 );
+
+CREATE TABLE IF NOT EXISTS spread_positions (
+    spread_id               TEXT PRIMARY KEY,
+    ticker                  TEXT NOT NULL,
+    structure               TEXT NOT NULL CHECK (structure IN ('BULL_PUT_SPREAD', 'IRON_CONDOR')),
+    expiration_date         TEXT NOT NULL,
+    qty                     INTEGER NOT NULL CHECK (qty > 0),
+    legs_json               TEXT NOT NULL,
+    entry_credit_per_spread REAL NOT NULL,
+    max_risk_usd            REAL NOT NULL,
+    profit_target_debit     REAL NOT NULL,
+    stop_loss_debit         REAL NOT NULL,
+    state                   TEXT NOT NULL CHECK (
+                                state IN ('PENDING_OPEN', 'OPEN', 'PENDING_CLOSE', 'CLOSED', 'CANCELED')
+                            ),
+    open_order_id           TEXT,
+    close_order_id          TEXT,
+    realized_pnl_usd        REAL,
+    opened_at_ny            TEXT NOT NULL,
+    closed_at_ny            TEXT,
+    updated_at_ny           TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_spread_ticker_state ON spread_positions (ticker, state);
 """
 
 AUDIT_MIGRATION_COLUMNS = {
     "execution_status": "TEXT",   # PENDING_SUBMIT | SUBMITTED | SUBMIT_FAILED | DRY_RUN | NULL (rejected)
     "execution_error": "TEXT",
+}
+TRACKED_MIGRATION_COLUMNS = {
+    "spread_id": "TEXT",
 }
 
 
@@ -228,6 +254,28 @@ class TrackedOrderRecord:
     protection_order_id: Optional[str]
     last_error: Optional[str]
     submitted_at_ny: str
+    updated_at_ny: str
+    spread_id: Optional[str] = None
+
+
+@dataclass(frozen=True)
+class SpreadPositionRecord:
+    spread_id: str
+    ticker: str
+    structure: str
+    expiration_date: str
+    qty: int
+    legs_json: str
+    entry_credit_per_spread: float
+    max_risk_usd: float
+    profit_target_debit: float
+    stop_loss_debit: float
+    state: str
+    open_order_id: Optional[str]
+    close_order_id: Optional[str]
+    realized_pnl_usd: Optional[float]
+    opened_at_ny: str
+    closed_at_ny: Optional[str]
     updated_at_ny: str
 
 
@@ -263,6 +311,10 @@ class LedgerRepository:
             for col, col_type in AUDIT_MIGRATION_COLUMNS.items():
                 if col not in existing:
                     conn.execute(f"ALTER TABLE audit_log ADD COLUMN {col} {col_type}")
+            tracked_cols = {r["name"] for r in conn.execute("PRAGMA table_info(tracked_orders)").fetchall()}
+            for col, col_type in TRACKED_MIGRATION_COLUMNS.items():
+                if col not in tracked_cols:
+                    conn.execute(f"ALTER TABLE tracked_orders ADD COLUMN {col} {col_type}")
 
     # =========================================================================
     # 1. System State & Circuit Breaker (TRD-POL-006)
@@ -1000,14 +1052,24 @@ class LedgerRepository:
         as_of_ny: Optional[datetime] = None,
     ) -> None:
         ts_iso = (as_of_ny or now_ny()).astimezone(NY_TZ).isoformat()
+        symbol_str = (
+            ",".join(leg.option_symbol for leg in intent.legs)
+            if intent.legs
+            else (intent.option_symbol or intent.ticker)
+        )
+        exp_str = (
+            intent.expiration_date.isoformat()
+            if intent.expiration_date
+            else (intent.legs[0].expiration_date.isoformat() if intent.legs else None)
+        )
         with self._connect() as conn:
             conn.execute(
                 """
                 INSERT OR REPLACE INTO tracked_orders (
                     alpaca_order_id, client_order_id, audit_log_id, ticker, strategy, action, symbol,
                     qty, limit_price, strike_price, expiration_date, trailing_stop_pct,
-                    status, filled_qty, protection_status, submitted_at_ny, updated_at_ny
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'OPEN', 0.0, 'NONE', ?, ?)
+                    status, filled_qty, protection_status, submitted_at_ny, updated_at_ny, spread_id
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'OPEN', 0.0, 'NONE', ?, ?, ?)
                 """,
                 (
                     alpaca_order_id,
@@ -1016,14 +1078,15 @@ class LedgerRepository:
                     intent.ticker,
                     intent.strategy.value,
                     intent.action.value,
-                    intent.option_symbol or intent.ticker,
+                    symbol_str,
                     float(intent.qty),
                     intent.limit_price,
                     intent.strike_price,
-                    intent.expiration_date.isoformat() if intent.expiration_date else None,
+                    exp_str,
                     trailing_stop_pct,
                     ts_iso,
                     ts_iso,
+                    intent.spread_id,
                 ),
             )
 
@@ -1050,6 +1113,7 @@ class LedgerRepository:
             last_error=r["last_error"],
             submitted_at_ny=r["submitted_at_ny"],
             updated_at_ny=r["updated_at_ny"],
+            spread_id=r["spread_id"] if "spread_id" in r.keys() else None,
         )
 
     def list_tracked_orders(
@@ -1146,3 +1210,172 @@ class LedgerRepository:
                 (ts_iso, tkr),
             )
         return self.get_wheel_cycle(tkr)
+
+    # =========================================================================
+    # 9. Multi-Leg Defined-Risk Spread Tracking (Bull Put Spread / Iron Condor)
+    # =========================================================================
+
+    def record_spread_pending_open(
+        self,
+        spread_id: str,
+        ticker: str,
+        structure: str,
+        expiration_date: str,
+        qty: int,
+        legs_json: str,
+        entry_credit_per_spread: float,
+        max_risk_usd: float,
+        profit_target_debit: float,
+        stop_loss_debit: float,
+        open_order_id: str,
+        as_of_ny: Optional[datetime] = None,
+    ) -> None:
+        ts_iso = (as_of_ny or now_ny()).astimezone(NY_TZ).isoformat()
+        with self._connect() as conn:
+            conn.execute(
+                """
+                INSERT OR REPLACE INTO spread_positions (
+                    spread_id, ticker, structure, expiration_date, qty, legs_json,
+                    entry_credit_per_spread, max_risk_usd, profit_target_debit, stop_loss_debit,
+                    state, open_order_id, close_order_id, realized_pnl_usd, opened_at_ny, closed_at_ny, updated_at_ny
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'PENDING_OPEN', ?, NULL, NULL, ?, NULL, ?)
+                """,
+                (
+                    spread_id,
+                    ticker.strip().upper(),
+                    structure,
+                    expiration_date,
+                    qty,
+                    legs_json,
+                    entry_credit_per_spread,
+                    max_risk_usd,
+                    profit_target_debit,
+                    stop_loss_debit,
+                    open_order_id,
+                    ts_iso,
+                    ts_iso,
+                ),
+            )
+
+    def mark_spread_open(
+        self,
+        spread_id: str,
+        filled_credit_per_spread: Optional[float] = None,
+        profit_take_ratio: float = 0.50,
+        stop_loss_multiple: float = 2.5,
+        as_of_ny: Optional[datetime] = None,
+    ) -> None:
+        ts_iso = (as_of_ny or now_ny()).astimezone(NY_TZ).isoformat()
+        rec = self.get_spread_position(spread_id)
+        if rec is None:
+            return
+        credit = abs(filled_credit_per_spread) if filled_credit_per_spread else rec.entry_credit_per_spread
+        pt = round(max(0.05, credit * (1.0 - profit_take_ratio)), 2)
+        sl = round(max(credit + 0.10, credit * stop_loss_multiple), 2)
+        with self._connect() as conn:
+            conn.execute(
+                """
+                UPDATE spread_positions
+                   SET state = 'OPEN',
+                       entry_credit_per_spread = ?,
+                       profit_target_debit = ?,
+                       stop_loss_debit = ?,
+                       updated_at_ny = ?
+                 WHERE spread_id = ?
+                """,
+                (credit, pt, sl, ts_iso, spread_id),
+            )
+
+    def mark_spread_pending_close(
+        self, spread_id: str, close_order_id: str, as_of_ny: Optional[datetime] = None
+    ) -> None:
+        ts_iso = (as_of_ny or now_ny()).astimezone(NY_TZ).isoformat()
+        with self._connect() as conn:
+            conn.execute(
+                """
+                UPDATE spread_positions
+                   SET state = 'PENDING_CLOSE',
+                       close_order_id = ?,
+                       updated_at_ny = ?
+                 WHERE spread_id = ?
+                """,
+                (close_order_id, ts_iso, spread_id),
+            )
+
+    def mark_spread_closed(
+        self,
+        spread_id: str,
+        close_debit_per_spread: float,
+        as_of_ny: Optional[datetime] = None,
+    ) -> None:
+        ts_iso = (as_of_ny or now_ny()).astimezone(NY_TZ).isoformat()
+        rec = self.get_spread_position(spread_id)
+        if rec is None:
+            return
+        pnl = round((rec.entry_credit_per_spread - abs(close_debit_per_spread)) * 100.0 * rec.qty, 2)
+        with self._connect() as conn:
+            conn.execute(
+                """
+                UPDATE spread_positions
+                   SET state = 'CLOSED',
+                       realized_pnl_usd = ?,
+                       closed_at_ny = ?,
+                       updated_at_ny = ?
+                 WHERE spread_id = ?
+                """,
+                (pnl, ts_iso, ts_iso, spread_id),
+            )
+
+    def mark_spread_canceled(self, spread_id: str, as_of_ny: Optional[datetime] = None) -> None:
+        ts_iso = (as_of_ny or now_ny()).astimezone(NY_TZ).isoformat()
+        rec = self.get_spread_position(spread_id)
+        if rec is None:
+            return
+        new_state = "OPEN" if rec.state == "PENDING_CLOSE" else "CANCELED"
+        with self._connect() as conn:
+            conn.execute(
+                "UPDATE spread_positions SET state = ?, updated_at_ny = ? WHERE spread_id = ?",
+                (new_state, ts_iso, spread_id),
+            )
+
+    def get_spread_position(self, spread_id: str) -> Optional[SpreadPositionRecord]:
+        with self._connect() as conn:
+            row = conn.execute("SELECT * FROM spread_positions WHERE spread_id = ?", (spread_id,)).fetchone()
+            return self._row_to_spread(row) if row is not None else None
+
+    def list_spread_positions(
+        self, ticker: Optional[str] = None, states: Optional[tuple[str, ...]] = None
+    ) -> list[SpreadPositionRecord]:
+        query = "SELECT * FROM spread_positions WHERE 1=1"
+        params: list[object] = []
+        if ticker:
+            query += " AND ticker = ?"
+            params.append(ticker.strip().upper())
+        if states:
+            query += f" AND state IN ({','.join('?' * len(states))})"
+            params.extend(states)
+        query += " ORDER BY opened_at_ny DESC"
+        with self._connect() as conn:
+            return [self._row_to_spread(r) for r in conn.execute(query, params).fetchall()]
+
+    @staticmethod
+    def _row_to_spread(r: sqlite3.Row) -> SpreadPositionRecord:
+        return SpreadPositionRecord(
+            spread_id=r["spread_id"],
+            ticker=r["ticker"],
+            structure=r["structure"],
+            expiration_date=r["expiration_date"],
+            qty=int(r["qty"]),
+            legs_json=r["legs_json"],
+            entry_credit_per_spread=float(r["entry_credit_per_spread"]),
+            max_risk_usd=float(r["max_risk_usd"]),
+            profit_target_debit=float(r["profit_target_debit"]),
+            stop_loss_debit=float(r["stop_loss_debit"]),
+            state=r["state"],
+            open_order_id=r["open_order_id"],
+            close_order_id=r["close_order_id"],
+            realized_pnl_usd=float(r["realized_pnl_usd"]) if r["realized_pnl_usd"] is not None else None,
+            opened_at_ny=r["opened_at_ny"],
+            closed_at_ny=r["closed_at_ny"],
+            updated_at_ny=r["updated_at_ny"],
+        )

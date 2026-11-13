@@ -8,7 +8,7 @@ import logging
 import signal
 import sys
 import time
-from datetime import datetime, time as dt_time
+from datetime import date, datetime, time as dt_time
 from types import FrameType
 from typing import Any, Optional, Sequence
 
@@ -20,6 +20,7 @@ from src.execution.risk_gateway import RiskGateway
 from src.intelligence.analyst import GeminiAnalyst
 from src.intelligence.schemas import (
     MarketContextPacket,
+    OptionContractQuote,
     OptionRight,
     OrderIntent,
     PortfolioSnapshot,
@@ -29,6 +30,7 @@ from src.intelligence.schemas import (
     WheelState,
 )
 from src.persistence.ledger import LedgerRepository
+from src.strategies.credit_spreads import CreditSpreadStrategy
 from src.strategies.indicators import (
     compute_atr_14,
     compute_bid_ask_spread_pct,
@@ -113,6 +115,11 @@ class TradingOrchestrator:
             ledger=ledger,
             analyst=analyst,
         )
+        self.credit_spreads = CreditSpreadStrategy(
+            settings=settings,
+            ledger=ledger,
+            analyst=analyst,
+        )
         self._shutdown_requested = False
         self._logger = logging.getLogger(__name__)
 
@@ -178,6 +185,28 @@ class TradingOrchestrator:
                         TradeAction.BUY_TO_CLOSE_CC.value,
                     ):
                         self.wheel.reconcile_filled_order(updated_order, as_of_ny=as_of_ny)
+                    elif (
+                        order.action
+                        in (TradeAction.OPEN_BULL_PUT_SPREAD.value, TradeAction.OPEN_IRON_CONDOR.value)
+                        and order.spread_id
+                    ):
+                        self.ledger.mark_spread_open(
+                            spread_id=order.spread_id,
+                            filled_credit_per_spread=fill_price,
+                            profit_take_ratio=self.settings.SPREAD_PROFIT_TAKE_RATIO,
+                            stop_loss_multiple=self.settings.SPREAD_STOP_LOSS_MULTIPLE,
+                            as_of_ny=as_of_ny,
+                        )
+                    elif (
+                        order.action
+                        in (TradeAction.CLOSE_BULL_PUT_SPREAD.value, TradeAction.CLOSE_IRON_CONDOR.value)
+                        and order.spread_id
+                    ):
+                        self.ledger.mark_spread_closed(
+                            spread_id=order.spread_id,
+                            close_debit_per_spread=fill_price if fill_price is not None else (order.limit_price or 0.0),
+                            as_of_ny=as_of_ny,
+                        )
                     summary["fills_reconciled"] += 1
                 elif status_res.status in ("canceled", "cancelled", "expired", "rejected", "done_for_day"):
                     self.ledger.update_tracked_order(
@@ -185,6 +214,8 @@ class TradingOrchestrator:
                         status="CLOSED_UNFILLED",
                         last_error=f"Broker order ended with status={status_res.status}",
                     )
+                    if order.spread_id:
+                        self.ledger.mark_spread_canceled(order.spread_id, as_of_ny=as_of_ny)
             except Exception as exc:
                 self._logger.warning(
                     f"Order reconciliation error for {order.alpaca_order_id}: {exc}",
@@ -237,8 +268,16 @@ class TradingOrchestrator:
             for tkr in self.settings.wheel_tickers:
                 self.wheel.reconcile_wheel_positions(ticker=tkr, positions=positions, as_of_ny=as_of_ny)
                 summary["wheel_cycles_reconciled"] += 1
+            pos_symbols = {str(getattr(p, "symbol", "")).strip().upper() for p in positions}
+            today = as_of_ny.date()
+            for sp in self.ledger.list_spread_positions(states=("OPEN",)):
+                if today > date.fromisoformat(sp.expiration_date):
+                    leg_syms = {str(l["option_symbol"]).upper() for l in json.loads(sp.legs_json)}
+                    if not (leg_syms & pos_symbols):
+                        self.ledger.mark_spread_closed(sp.spread_id, close_debit_per_spread=0.0, as_of_ny=as_of_ny)
+                        summary["fills_reconciled"] += 1
         except Exception as exc:
-            self._logger.warning(f"Wheel position reconciliation error: {exc}")
+            self._logger.warning(f"Position reconciliation error: {exc}")
 
         return summary
 
@@ -508,6 +547,102 @@ class TradingOrchestrator:
                         f"SmartMoney strategy error for {disclosure.ticker}: {exc}",
                         extra={"ticker": disclosure.ticker},
                     )
+
+        # ---------------------------------------------------------------------
+        # Strategy 4: Multi-Leg Defined-Risk Credit Spreads & Iron Condors (`CREDIT_SPREAD_WATCHLIST`)
+        # ---------------------------------------------------------------------
+        if has_option_data and has_stock_data:
+            # Step 4a: Monitor open spreads for 50% early profit-take or stop-loss close (even in blackout)
+            if hasattr(self.broker.option_data_client, "get_option_latest_quote"):
+                open_spread_ids = {
+                    o.spread_id for o in self.ledger.list_tracked_orders(status="OPEN") if o.spread_id
+                }
+                for sp in self.ledger.list_spread_positions(states=("OPEN",)):
+                    if sp.spread_id in open_spread_ids:
+                        continue
+                    try:
+                        raw_legs = json.loads(sp.legs_json)
+                        quotes_map: dict[str, OptionContractQuote] = {}
+                        for leg in raw_legs:
+                            sym = str(leg["option_symbol"])
+                            oq = self.broker.get_option_quote(sym)
+                            if oq is not None:
+                                quotes_map[sym] = oq
+                        close_intent = self.credit_spreads.check_spread_exit(
+                            spread=sp,
+                            quotes_by_symbol=quotes_map,
+                            as_of_ny=clock.timestamp_ny,
+                        )
+                        if close_intent is not None:
+                            portfolio = self._submit_intent(close_intent, portfolio, dry_run, submitted_actions)
+                    except Exception as exc:
+                        self._logger.warning(
+                            f"Spread exit check error for {sp.spread_id}: {exc}",
+                            extra={"ticker": sp.ticker},
+                        )
+
+            # Step 4b: Open weekly Iron Condor and/or Deeper Bull Put Spread when outside blackout
+            if not in_blackout:
+                for tkr in self.settings.credit_spread_tickers:
+                    if self.ledger.count_open_tracked(tkr) > 0:
+                        continue
+                    try:
+                        active_spreads = self.ledger.list_spread_positions(
+                            ticker=tkr,
+                            states=("PENDING_OPEN", "OPEN", "PENDING_CLOSE"),
+                        )
+                        has_ic = any(sp.structure == "IRON_CONDOR" for sp in active_spreads)
+                        has_bps = any(sp.structure == "BULL_PUT_SPREAD" for sp in active_spreads)
+                        if has_ic and has_bps:
+                            continue
+
+                        packet = self._build_market_context(tkr, StrategyType.CREDIT_SPREAD, clock.timestamp_ny)
+                        if packet is None:
+                            continue
+                        put_chain = self.broker.get_option_chain_quotes(
+                            ticker=tkr,
+                            right=OptionRight.PUT,
+                            min_dte=self.settings.SPREAD_MIN_DTE,
+                            max_dte=self.settings.SPREAD_MAX_DTE,
+                            as_of_date=clock.timestamp_ny.date(),
+                        )
+                        if not has_ic:
+                            call_chain = self.broker.get_option_chain_quotes(
+                                ticker=tkr,
+                                right=OptionRight.CALL,
+                                min_dte=self.settings.SPREAD_MIN_DTE,
+                                max_dte=self.settings.SPREAD_MAX_DTE,
+                                as_of_date=clock.timestamp_ny.date(),
+                            )
+                            ic_intent = self.credit_spreads.build_iron_condor_intent(
+                                packet=packet,
+                                put_chain=put_chain,
+                                call_chain=call_chain,
+                                portfolio=portfolio,
+                            )
+                            if ic_intent is not None:
+                                portfolio = self._submit_intent(ic_intent, portfolio, dry_run, submitted_actions)
+                                # Update local view before checking deeper BPS (note TRD-POL-005 15m cooldown applies if live)
+                                active_spreads = self.ledger.list_spread_positions(
+                                    ticker=tkr,
+                                    states=("PENDING_OPEN", "OPEN", "PENDING_CLOSE"),
+                                )
+                                has_bps = any(sp.structure == "BULL_PUT_SPREAD" for sp in active_spreads)
+
+                        if not has_bps:
+                            bps_intent = self.credit_spreads.build_bull_put_spread_intent(
+                                packet=packet,
+                                put_chain=put_chain,
+                                portfolio=portfolio,
+                                deeper_otm=True,
+                            )
+                            if bps_intent is not None:
+                                portfolio = self._submit_intent(bps_intent, portfolio, dry_run, submitted_actions)
+                    except Exception as exc:
+                        self._logger.warning(
+                            f"CreditSpread strategy error for {tkr}: {exc}",
+                            extra={"ticker": tkr},
+                        )
 
         # Immediately attach trailing stops / advance Wheel state if any newly submitted orders filled fast
         if submitted_actions and not dry_run:

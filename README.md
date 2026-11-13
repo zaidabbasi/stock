@@ -89,6 +89,15 @@ Notes on Market Data & Analyst Keys:
 .venv/bin/python -m src.main --interval 60
 ```
 
+### Multi-Leg Defined-Risk Credit Spreads (`OrderClass.MLEG`) & Zero-Cost `RULES` Mode
+
+- **Credit Spreads (`StrategyType.CREDIT_SPREAD`)**: Targets `~$30/week` (`WEEKLY_CREDIT_TARGET_USD`) on `CREDIT_SPREAD_WATCHLIST` (default `GOOGL`) using defined-risk multi-leg `OrderClass.MLEG` orders:
+  - **Iron Condor (`OPEN_IRON_CONDOR`)**: 4-leg defined-risk neutral spread (~8–12 delta short put/call wings) requiring positive net credit after 25% spread haircut and non-overlapping wing collateral caps.
+  - **Deeper Bull Put Credit Spread (`OPEN_BULL_PUT_SPREAD`)**: 2-leg defined-risk deeper-OTM put credit spread (~4–8 delta, strictly below any open Iron Condor long put strike) for stacked conservative income.
+  - **Automated Exits (`CLOSE_IRON_CONDOR` / `CLOSE_BULL_PUT_SPREAD`)**: Takes profit at 50% of entry credit (`SPREAD_PROFIT_TAKE_RATIO=0.50`), exits on 2.5x credit stop-loss (`SPREAD_STOP_LOSS_MULTIPLE=2.5`), or closes before expiry (< 1 DTE).
+  - **Net Exposure Accounting (`TRD-POL-001` / `TRD-POL-002`)**: Pairs multi-leg option wings per `(underlying, expiration)` so defined-risk collateral is bounded by `max(put_width, call_width) * 100 * qty - net_credit`, enforcing the strict 5% single-ticker equity cap (`MAX_POSITION_PCT=0.05`) without naked short exposure.
+- **Zero-Cost Testing (`ANALYST_MODE=RULES`)**: Set `ANALYST_MODE=RULES` in `.env` to run deterministic indicator & liquidity gating with **zero calls** (and `$0.00` charges) to `GEMINI_API_KEY`. When you add your own Google AI Studio Free-Tier `GEMINI_API_KEY`, switch back to `ANALYST_MODE=GEMINI`.
+
 ### 4. Manually Clear a `HALTED` Circuit Breaker (`TRD-POL-006`)
 
 ```bash

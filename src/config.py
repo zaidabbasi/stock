@@ -78,8 +78,9 @@ class Settings(BaseSettings):
     ANALYST_CACHE_MINUTES: int = Field(default=60, ge=1, le=1440)
 
     # --- Universe ---
-    MOMENTUM_WATCHLIST: str = Field(default="AAPL,MSFT,NVDA,AMZN,GOOGL,META")
+    MOMENTUM_WATCHLIST: str = Field(default="AAPL,MSFT,NVDA,AMZN,META")
     WHEEL_WATCHLIST: str = Field(default="F,PFE,T,SOFI,INTC")
+    CREDIT_SPREAD_WATCHLIST: str = Field(default="GOOGL")
     DISCLOSURE_FEED_PATH: Path = Field(default=Path("data/disclosures.json"))
 
     # --- Market Data Feeds ---
@@ -99,8 +100,13 @@ class Settings(BaseSettings):
     MAX_DISCLOSURE_LAG_DAYS: int = Field(default=14, ge=1, le=30)
     MIN_DAILY_DOLLAR_VOLUME: float = Field(default=5_000_000.0, gt=0.0)
     MAX_OPTION_SPREAD_PCT: float = Field(default=0.25, gt=0.0, le=0.50)
-    ENTRY_BLACKOUT_MINUTES_AFTER_OPEN: int = Field(default=5, ge=0, le=120)
+    ENTRY_BLACKOUT_MINUTES_AFTER_OPEN: int = Field(default=15, ge=0, le=120)
     ENTRY_BLACKOUT_MINUTES_BEFORE_CLOSE: int = Field(default=15, ge=0, le=120)
+    WEEKLY_CREDIT_TARGET_USD: float = Field(default=30.0, gt=0.0, le=500.0)
+    SPREAD_MIN_DTE: int = Field(default=5, ge=1, le=30)
+    SPREAD_MAX_DTE: int = Field(default=14, ge=3, le=45)
+    SPREAD_PROFIT_TAKE_RATIO: float = Field(default=0.50, gt=0.0, lt=1.0)
+    SPREAD_STOP_LOSS_MULTIPLE: float = Field(default=2.5, gt=1.0, le=10.0)
 
     # --- Orchestrator, Persistence & Observability ---
     POLL_INTERVAL_SECONDS: int = Field(default=60, ge=10, le=3600)
@@ -121,6 +127,11 @@ class Settings(BaseSettings):
                 f"MOMENTUM_WATCHLIST and WHEEL_WATCHLIST must be disjoint (overlap: {sorted(overlap)}); "
                 "Wheel assignment detection relies on share counts being owned solely by the Wheel."
             )
+        opt_overlap = set(self.wheel_tickers) & set(self.credit_spread_tickers)
+        if opt_overlap:
+            raise ValueError(
+                f"WHEEL_WATCHLIST and CREDIT_SPREAD_WATCHLIST must be disjoint (overlap: {sorted(opt_overlap)})."
+            )
         return self
 
     @property
@@ -130,6 +141,10 @@ class Settings(BaseSettings):
     @property
     def wheel_tickers(self) -> tuple[str, ...]:
         return _parse_tickers(self.WHEEL_WATCHLIST)
+
+    @property
+    def credit_spread_tickers(self) -> tuple[str, ...]:
+        return _parse_tickers(self.CREDIT_SPREAD_WATCHLIST)
 
     @property
     def has_gemini_key(self) -> bool:

@@ -211,10 +211,19 @@ def render_dashboard() -> None:
         dip_df = load_table_df(db_path, "SELECT * FROM dip_ladders ORDER BY ticker ASC")
         st.dataframe(dip_df, use_container_width=True) if not dip_df.empty else st.info("No active dip-ladder trackers.")
 
+    st.subheader("Multi-Leg Defined-Risk Credit Spreads (`spread_positions`)")
+    spread_df = load_table_df(
+        db_path,
+        "SELECT spread_id, ticker, structure, expiration_date, qty, entry_credit_per_spread, max_risk_usd, profit_target_debit, stop_loss_debit, state, realized_pnl_usd, updated_at_ny FROM spread_positions ORDER BY opened_at_ny DESC LIMIT 100",
+    )
+    st.dataframe(spread_df, use_container_width=True) if not spread_df.empty else st.info("No spread positions yet.")
+
+    st.divider()
+
     st.subheader("Tracked Broker Orders & Trailing-Stop Protection (`tracked_orders`)")
     tracked_df = load_table_df(
         db_path,
-        "SELECT alpaca_order_id, ticker, strategy, action, status, filled_qty, filled_avg_price, protection_status, protection_order_id, updated_at_ny FROM tracked_orders ORDER BY updated_at_ny DESC LIMIT 100",
+        "SELECT alpaca_order_id, ticker, strategy, action, status, filled_qty, filled_avg_price, protection_status, protection_order_id, spread_id, updated_at_ny FROM tracked_orders ORDER BY updated_at_ny DESC LIMIT 100",
     )
     st.dataframe(tracked_df, use_container_width=True) if not tracked_df.empty else st.info("No tracked orders yet.")
 

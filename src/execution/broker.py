@@ -24,11 +24,12 @@ from alpaca.data.requests import (
 )
 from alpaca.data.timeframe import TimeFrame
 from alpaca.trading.client import TradingClient
-from alpaca.trading.enums import ContractType, OrderSide, QueryOrderStatus, TimeInForce
+from alpaca.trading.enums import ContractType, OrderClass, OrderSide, PositionIntent, QueryOrderStatus, TimeInForce
 from alpaca.trading.requests import (
     GetOrdersRequest,
     LimitOrderRequest,
     MarketOrderRequest,
+    OptionLegRequest,
     TrailingStopOrderRequest,
 )
 
@@ -278,34 +279,155 @@ class AlpacaBroker:
             else:
                 option_positions.append((pos, parsed_occ))
 
-        # Pass 2: option positions (account for assignment notional on short puts!)
-        for pos, (underlying, _exp, right, strike) in option_positions:
+        # Pass 2: option positions (net defined-risk spreads at same expiry; value unpaired short puts at strike notional)
+        option_buckets: dict[tuple[str, date], dict[str, list[list[float]]]] = {}
+        for pos, (underlying, exp_dt, right, strike) in option_positions:
             qty_val = float(getattr(pos, "qty", 0.0) or 0.0)
             mkt_val = abs(float(getattr(pos, "market_value", 0.0) or 0.0))
-            if qty_val < 0 and right == OptionRight.PUT:
-                assignment_notional = 100.0 * strike * abs(qty_val)
-                exposure_by_ticker[underlying] = exposure_by_ticker.get(underlying, 0.0) + assignment_notional
-                broker_reserved_csp_collateral += assignment_notional
-            elif qty_val < 0 and right == OptionRight.CALL:
-                covered_contracts = max(0.0, equity_shares_by_ticker.get(underlying, 0.0) / 100.0)
-                uncovered_contracts = max(0.0, abs(qty_val) - covered_contracts)
-                if uncovered_contracts > 0:
-                    exposure_by_ticker[underlying] = (
-                        exposure_by_ticker.get(underlying, 0.0) + 100.0 * strike * uncovered_contracts
-                    )
+            if qty_val == 0:
+                continue
+            bucket = option_buckets.setdefault(
+                (underlying, exp_dt),
+                {"short_put": [], "long_put": [], "short_call": [], "long_call": [], "long_mkt": []},
+            )
+            if right == OptionRight.PUT:
+                if qty_val < 0:
+                    bucket["short_put"].append([strike, abs(qty_val)])
+                else:
+                    bucket["long_put"].append([strike, qty_val])
+                    bucket["long_mkt"].append([mkt_val])
             else:
-                exposure_by_ticker[underlying] = exposure_by_ticker.get(underlying, 0.0) + mkt_val
+                if qty_val < 0:
+                    bucket["short_call"].append([strike, abs(qty_val)])
+                else:
+                    bucket["long_call"].append([strike, qty_val])
+                    bucket["long_mkt"].append([mkt_val])
 
-        # Pass 3: pending open orders (open BUY equity or open SELL put orders)
+        for (underlying, _exp_dt), bkt in option_buckets.items():
+            # Reduce short calls covered by 100-share equity lots
+            covered_calls_avail = max(0.0, equity_shares_by_ticker.get(underlying, 0.0) / 100.0)
+            short_calls = sorted(bkt["short_call"], key=lambda x: x[0])
+            uncovered_short_calls: list[list[float]] = []
+            for s_strike, s_qty in short_calls:
+                cov = min(s_qty, covered_calls_avail)
+                covered_calls_avail -= cov
+                rem = s_qty - cov
+                if rem > 1e-6:
+                    uncovered_short_calls.append([s_strike, rem])
+
+            # Pair short puts with protective lower-or-any long puts (descending strike order)
+            sp_list = sorted(bkt["short_put"], key=lambda x: x[0], reverse=True)
+            lp_list = sorted(bkt["long_put"], key=lambda x: x[0], reverse=True)
+            put_spread_risk = 0.0
+            unpaired_put_risk = 0.0
+            lp_idx = 0
+            for s_strike, s_qty in sp_list:
+                rem = s_qty
+                while rem > 1e-6 and lp_idx < len(lp_list):
+                    l_strike, l_qty = lp_list[lp_idx]
+                    if l_qty <= 1e-6:
+                        lp_idx += 1
+                        continue
+                    paired = min(rem, l_qty)
+                    put_spread_risk += max(0.0, s_strike - l_strike) * 100.0 * paired
+                    rem -= paired
+                    lp_list[lp_idx][1] -= paired
+                    if lp_list[lp_idx][1] <= 1e-6:
+                        lp_idx += 1
+                if rem > 1e-6:
+                    unpaired_risk = 100.0 * s_strike * rem
+                    unpaired_put_risk += unpaired_risk
+                    broker_reserved_csp_collateral += unpaired_risk
+
+            # Pair uncovered short calls with protective higher long calls (ascending strike order)
+            sc_list = sorted(uncovered_short_calls, key=lambda x: x[0])
+            lc_list = sorted(bkt["long_call"], key=lambda x: x[0])
+            call_spread_risk = 0.0
+            unpaired_call_risk = 0.0
+            lc_idx = 0
+            for s_strike, s_qty in sc_list:
+                rem = s_qty
+                while rem > 1e-6 and lc_idx < len(lc_list):
+                    l_strike, l_qty = lc_list[lc_idx]
+                    if l_qty <= 1e-6:
+                        lc_idx += 1
+                        continue
+                    paired = min(rem, l_qty)
+                    call_spread_risk += max(0.0, l_strike - s_strike) * 100.0 * paired
+                    rem -= paired
+                    lc_list[lc_idx][1] -= paired
+                    if lc_list[lc_idx][1] <= 1e-6:
+                        lc_idx += 1
+                if rem > 1e-6:
+                    unpaired_call_risk += 100.0 * s_strike * rem
+
+            # At expiration, worst case across put vs call wings cannot occur on both sides simultaneously
+            condor_wing_risk = max(put_spread_risk, call_spread_risk)
+            unpaired_long_val = sum(m[0] for m in bkt["long_mkt"]) if (unpaired_put_risk + unpaired_call_risk == 0 and condor_wing_risk == 0) else 0.0
+            broker_reserved_csp_collateral += condor_wing_risk
+            exposure_by_ticker[underlying] = (
+                exposure_by_ticker.get(underlying, 0.0)
+                + condor_wing_risk
+                + unpaired_put_risk
+                + unpaired_call_risk
+                + unpaired_long_val
+            )
+
+        # Pass 3: pending open orders (open BUY equity, open SELL put orders, or open MLEG orders)
         for order in open_orders:
-            sym = str(getattr(order, "symbol", "")).strip().upper()
-            side_raw = getattr(order, "side", "")
-            side_str = str(getattr(side_raw, "value", side_raw)).lower()
             qty_total = float(getattr(order, "qty", 0.0) or 0.0)
             filled = float(getattr(order, "filled_qty", 0.0) or 0.0)
             remaining = max(0.0, qty_total - filled)
             if remaining <= 0:
                 continue
+
+            order_legs = getattr(order, "legs", None)
+            if order_legs:
+                leg_short_puts: list[float] = []
+                leg_long_puts: list[float] = []
+                leg_short_calls: list[float] = []
+                leg_long_calls: list[float] = []
+                leg_underlying: Optional[str] = None
+                for leg in order_legs:
+                    lsym = str(getattr(leg, "symbol", "")).strip().upper()
+                    parsed_leg = parse_occ_option_symbol(lsym)
+                    if parsed_leg is None:
+                        continue
+                    l_und, _l_exp, l_right, l_strike = parsed_leg
+                    leg_underlying = leg_underlying or l_und
+                    l_side_raw = getattr(leg, "side", "")
+                    l_side = str(getattr(l_side_raw, "value", l_side_raw)).lower()
+                    l_intent_raw = getattr(leg, "position_intent", "")
+                    l_intent = str(getattr(l_intent_raw, "value", l_intent_raw)).lower()
+                    if "sell_to_open" in l_intent or (not l_intent and l_side == "sell"):
+                        if l_right == OptionRight.PUT:
+                            leg_short_puts.append(l_strike)
+                        else:
+                            leg_short_calls.append(l_strike)
+                    elif "buy_to_open" in l_intent or (not l_intent and l_side == "buy"):
+                        if l_right == OptionRight.PUT:
+                            leg_long_puts.append(l_strike)
+                        else:
+                            leg_long_calls.append(l_strike)
+                if leg_underlying:
+                    p_risk = (
+                        max(0.0, max(leg_short_puts) - min(leg_long_puts)) * 100.0 * remaining
+                        if (leg_short_puts and leg_long_puts)
+                        else sum(100.0 * s * remaining for s in leg_short_puts)
+                    )
+                    c_risk = (
+                        max(0.0, max(leg_long_calls) - min(leg_short_calls)) * 100.0 * remaining
+                        if (leg_short_calls and leg_long_calls)
+                        else sum(100.0 * s * remaining for s in leg_short_calls)
+                    )
+                    wing_risk = max(p_risk, c_risk)
+                    exposure_by_ticker[leg_underlying] = exposure_by_ticker.get(leg_underlying, 0.0) + wing_risk
+                    broker_reserved_csp_collateral += wing_risk
+                continue
+
+            sym = str(getattr(order, "symbol", "") or "").strip().upper()
+            side_raw = getattr(order, "side", "")
+            side_str = str(getattr(side_raw, "value", side_raw)).lower()
 
             parsed_occ = parse_occ_option_symbol(sym)
             if parsed_occ is not None:
@@ -314,7 +436,7 @@ class AlpacaBroker:
                     notional = 100.0 * strike * remaining
                     exposure_by_ticker[underlying] = exposure_by_ticker.get(underlying, 0.0) + notional
                     broker_reserved_csp_collateral += notional
-            elif side_str == "buy":
+            elif sym and side_str == "buy":
                 underlying = self.extract_underlying_ticker(sym)
                 limit_p = getattr(order, "limit_price", None)
                 notional_p = getattr(order, "notional", None)
@@ -461,6 +583,35 @@ class AlpacaBroker:
                 client_order_id=client_order_id,
             )
 
+        if intent.action in (
+            TradeAction.OPEN_BULL_PUT_SPREAD,
+            TradeAction.OPEN_IRON_CONDOR,
+            TradeAction.CLOSE_BULL_PUT_SPREAD,
+            TradeAction.CLOSE_IRON_CONDOR,
+        ):
+            if not (2 <= len(intent.legs) <= 4) or intent.limit_price is None or intent.limit_price <= 0:
+                raise ValueError(f"{intent.action.value} requires 2-4 option legs and positive limit_price.")
+            is_open_credit = intent.action in (TradeAction.OPEN_BULL_PUT_SPREAD, TradeAction.OPEN_IRON_CONDOR)
+            # Alpaca MLEG API convention: negative limit_price = net credit received; positive = net debit paid.
+            signed_limit = -abs(round(intent.limit_price, 2)) if is_open_credit else abs(round(intent.limit_price, 2))
+            alpaca_legs = [
+                OptionLegRequest(
+                    symbol=leg.option_symbol,
+                    ratio_qty=leg.ratio_qty,
+                    side=OrderSide.SELL if leg.side == "SELL" else OrderSide.BUY,
+                    position_intent=PositionIntent(leg.position_intent),
+                )
+                for leg in intent.legs
+            ]
+            return LimitOrderRequest(
+                order_class=OrderClass.MLEG,
+                qty=intent.qty,
+                time_in_force=TimeInForce.DAY,
+                limit_price=signed_limit,
+                legs=alpaca_legs,
+                client_order_id=client_order_id,
+            )
+
         raise ValueError(f"Unsupported TradeAction for broker order submission: {intent.action}")
 
     # =========================================================================
@@ -577,6 +728,11 @@ class AlpacaBroker:
             ask = float(getattr(lq, "ask_price", 0.0) or 0.0)
             if bid <= 0.0 or ask <= 0.0 or ask < bid:
                 continue
+            greeks = getattr(snap, "greeks", None)
+            delta = float(greeks.delta) if getattr(greeks, "delta", None) is not None else None
+            theta = float(greeks.theta) if getattr(greeks, "theta", None) is not None else None
+            iv_val = getattr(snap, "implied_volatility", None)
+            iv = float(iv_val) if iv_val is not None else None
             results.append(
                 OptionContractQuote(
                     option_symbol=str(occ_sym),
@@ -586,6 +742,9 @@ class AlpacaBroker:
                     expiration_date=exp_date,
                     bid=bid,
                     ask=ask,
+                    delta=delta,
+                    theta=theta,
+                    implied_volatility=iv,
                 )
             )
         return results
